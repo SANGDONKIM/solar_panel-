@@ -114,6 +114,7 @@ split %>%
     plot_time_series_cv_plan(time, ulsan, .interactive = TRUE)
 
 
+
 # Model 1
 
 model_fit_arima_no_boost <- arima_reg() %>%
@@ -121,28 +122,110 @@ model_fit_arima_no_boost <- arima_reg() %>%
     fit(ulsan ~ time, training(split))
 
 
-
 # Model 2 Boosted Auto ARIMA 
-model_fit_arima_boosted <- arima_boost(mtry = tune(),
-                                       trees = tune(),
-                                       min_n = tune(),
-                                       tree_depth = tune(),
-                                       learn_rate = tune(),
-                                       loss_reduction = tune(),
-                                       sample_size = tune(),
-                                       stop_iter = tune(), 
-                                       seasonal_period = tune(),
-                                       non_seasonal_ar = tune(),
-                                       non_seasonal_differences = tune(),
-                                       non_seasonal_ma = tune(),
-                                       seasonal_ar = tune(),
-                                       seasonal_differences = tune(),
-                                       seasonal_ma = tune(),
+
+model_fit_arima_boosted <- arima_boost(
+    min_n = 2,
+    learn_rate = 0.015
 ) %>%
     set_engine(engine = "auto_arima_xgboost") %>%
-    fit(value ~ date + as.numeric(date) + factor(month(date, label = TRUE), ordered = F), 
+    fit(ulsan ~ time + as.numeric(time) + factor(month(time), ordered = F),
+        data = training(split))
+# mtry = tune(),
+# trees = tune(),
+# min_n = tune(),
+# tree_depth = tune(),
+# learn_rate = tune(),
+# loss_reduction = tune(),
+# sample_size = tune(),
+# stop_iter = tune(), 
+# seasonal_period = tune(),
+# non_seasonal_ar = tune(),
+# non_seasonal_differences = tune(),
+# non_seasonal_ma = tune(),
+# seasonal_ar = tune(),
+# seasonal_differences = tune(),
+# seasonal_ma = tune(),
+
+
+# Model 3: ets ----
+model_fit_ets <- exp_smoothing() %>%
+    set_engine(engine = "ets") %>%
+    fit(ulsan ~ time, data = training(split))
+#> frequency = 12 observations per 1 year
+
+
+# Model 4: prophet ----
+model_fit_prophet <- prophet_reg() %>%
+    set_engine(engine = "prophet") %>%
+    fit(ulsan ~ time, data = training(split))
+#> Disabling weekly seasonality. Run prophet with weekly.seasonality=TRUE to override this.
+#> Disabling daily seasonality. Run prophet with daily.seasonality=TRUE to override this.
+
+
+# Model 5: lm ----
+model_fit_lm <- linear_reg() %>%
+    set_engine("lm") %>%
+    fit(ulsan ~ as.numeric(time) + factor(month(time), ordered = FALSE),
         data = training(split))
 
+# Model 6: earth ----
+model_spec_mars <- mars(mode = "regression") %>%
+    set_engine("earth") 
 
+recipe_spec <- recipe(ulsan ~ time, data = training(split)) %>%
+    step_date(time, features = "month", ordinal = FALSE) %>%
+    step_mutate(date_num = as.numeric(time)) %>%
+    step_normalize(date_num) %>%
+    step_rm(time)
+
+wflw_fit_mars <- workflow() %>%
+    add_recipe(recipe_spec) %>%
+    add_model(model_spec_mars) %>%
+    fit(training(split))
+
+
+models_tbl <- modeltime_table(
+    model_fit_arima_no_boost,
+    model_fit_arima_boosted,
+    model_fit_ets,
+    model_fit_prophet,
+    model_fit_lm,
+    wflw_fit_mars
+)
+
+models_tbl
+
+calibration_tbl <- models_tbl %>%
+    modeltime_calibrate(new_data = testing(split))
+
+calibration_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(split),
+        actual_data = ulsan
+    ) %>%
+    plot_modeltime_forecast(
+        .legend_max_width = 25, # For mobile screens
+        .interactive      = FALSE
+    )
+
+calibration_tbl
+
+calibration_tbl %>%
+    modeltime_accuracy() %>%
+    table_modeltime_accuracy(
+        .interactive = FALSE
+    )
+
+
+refit_tbl <- calibration_tbl %>%
+    modeltime_refit(data = ulsan)
+
+refit_tbl %>%
+    modeltime_forecast(h = "1 month", actual_data = ulsan) %>%
+    plot_modeltime_forecast(
+        .legend_max_width = 25, # For mobile screens
+        .interactive      = FALSE
+    )
 
 
