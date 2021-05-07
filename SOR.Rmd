@@ -1,0 +1,198 @@
+---
+title: "solar panel data analysis"
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 5
+    fig_height: 4
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+```
+
+# Preparations (준비작업) {.tabset .tabset-fade}
+
+## Libraries
+
+```{r load_lib, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(data.table)
+library(skimr)
+library(tibble)
+library(tibbletime)
+library(timetk)
+library(imputeTS)
+library(anomalize)
+library(forecast)
+library(GGally)
+library(modeltime)
+library(gt)
+library(timetk)
+library(lubridate)
+library(janitor)
+library(tidyquant)
+
+# Visualization
+library(ggthemes)
+library(ggsci)
+library(viridis)
+library(ggExtra)
+
+
+theme_set(theme_bw())
+```
+
+## Data load
+
+```{r}
+file_path <- "./data/"
+files <- list.files(file_path)
+files
+```
+
+```{r, message=FALSE}
+rdata <- fread(file.path(file_path, "rdata.csv"))
+```
+
+# Data overview (데이터 기본정보) {.tabset .tabset-fade}
+
+## train data
+
+```{r}
+head(rdata)
+glimpse(rdata)
+skim(rdata)
+```
+
+# 데이터 전처리 {.tabset .tabset-fade}
+
+
+```{r}
+rdata %>% 
+    select(-hour) %>% 
+    mutate(time = ymd_hms(time)) %>% 
+    filter(between(time, ymd('2018-03-01'), ymd('2021-01-31'))) -> rdata
+
+rdata %>% glimpse()
+
+rdata %>% 
+  summarise(across(.fns = ~sum(is.na(.))/length(.)))
+
+rdata %>% 
+    select(-c(warehouse, dangjin, ulsan)) -> floating
+    
+rdata %>% 
+    select(-c(floating, dangjin, ulsan)) -> warehouse
+
+rdata %>% 
+    select(-c(floating, warehouse, ulsan)) -> dangjin
+
+rdata %>% 
+    select(-c(floating, warehouse, dangjin)) -> ulsan
+
+```
+
+
+
+```{r}
+floating %>% 
+    plot_time_series(time, floating, .interactive=F,.smooth=F,
+                   .line_size=1)
+
+
+warehouse %>% 
+    plot_time_series(time, warehouse)
+
+
+dangjin %>% 
+    plot_time_series(time, dangjin)
+
+
+ulsan %>% 
+    plot_time_series(time, ulsan)
+
+```
+
+
+
+# Extracting Features 
+
+Summary of the feature engineering process:
+* index.num: Number of seconds passed since 1970 to the current timestamp.
+* Diff: Number of seconds passed between timestamps.
+* half: Which half of the semester during the year (1 or 2)
+* quarter: Quarter of the year
+* month: Month of the year.
+* day: Day of the moth.
+* hour: Hour of the day
+* hour12: hour from 0-12 (it restarts in the afternoon) instead of 0-24
+* weekday: Day of the week
+* mday: Day of the month
+* qday: Day of the quarter
+* yday: Day of the year
+
+```{r}
+ulsan %>% 
+    tk_augment_timeseries_signature()
+```
+
+```{r}
+ulsan %>% 
+    tk_augment_timeseries_signature() %>% 
+    mutate(
+        ulsan_transformed = log_interval_vec(ulsan, limit_lower = 0, offset = 1),
+        ulsan_transformed = standardize_vec(ulsan_transformed)) %>% 
+    select(time, ulsan, ulsan_transformed, everything()) -> prepared_hourly_tbl
+
+```
+```{r}
+prepared_hourly_tbl %>% glimpse()
+```
+
+
+```{r}
+prepared_hour_split_tbl <- time_series_split(prepared_hourly_tbl, assess = "1 month", cumulative = TRUE)
+
+prepared_hour_split_tbl %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(time, ulsan, .interactive = FALSE)
+
+
+train_df <- training(prepared_hour_split_tbl)
+test_df <- testing(prepared_hour_split_tbl)
+
+```
+
+
+```{r}
+recipe_book <- recipe(ulsan_transformed ~ . , data = train_df) %>%
+    step_rm(matches("(iso)|(xts)|(quarter)|(year)|(month)|(qday)|(diff)")) %>% 
+    step_normalize(matches("(index.num)|(yday)")) %>% 
+    step_dummy(all_nominal(), one_hot = TRUE) %>% 
+    step_interact(~ matches("am.pm") * matches("wday.lbl")) %>% 
+    step_fourier(time, period = c(24, 48, 76), K=2) %>% 
+    step_ts_impute('증기압', '이슬점', '해면기압', '기압', '일조', '전운량', lambda = 'auto')
+
+recipe_book %>% prep() %>% juice() %>% glimpse()
+```
+
+```{r}
+rf_model <- rand_forest() %>% 
+  set_engine("randomForest") %>% 
+  set_mode("regression")
+
+workflow_model <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(recipe_book) %>% 
+  fit(train_df)
+
+```
