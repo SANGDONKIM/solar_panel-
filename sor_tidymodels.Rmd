@@ -1,0 +1,297 @@
+---
+title: "solar panel data analysis"
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 5
+    fig_height: 4
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+```
+
+# Preparations (준비작업) {.tabset .tabset-fade}
+
+## Libraries
+
+```{r load_lib, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(data.table)
+library(skimr)
+library(tibble)
+library(tibbletime)
+library(timetk)
+library(imputeTS)
+library(anomalize)
+library(forecast)
+library(GGally)
+library(modeltime)
+library(gt)
+library(timetk)
+library(lubridate)
+library(janitor)
+library(tidyquant)
+library(modeltime.resample)
+library(modeltime.ensemble)
+library(bestNormalize)
+
+# Visualization
+library(ggthemes)
+library(ggsci)
+library(viridis)
+library(ggExtra)
+
+
+theme_set(theme_bw())
+```
+
+## Data load {.tabset .tabset-fade}
+
+```{r}
+file_path <- "./data/"
+files <- list.files(file_path)
+files
+```
+
+```{r, message=FALSE}
+rdata1 <- fread(file.path(file_path, "rdata1.csv"))
+rdata2 <- fread(file.path(file_path, "rdata2.csv"))
+
+```
+
+# Data overview (데이터 기본정보) {.tabset .tabset-fade}
+
+## train data
+
+```{r}
+glimpse(rdata1)
+skim(rdata1)
+
+glimpse(rdata2)
+skim(rdata2)
+
+```
+
+# 데이터 전처리 {.tabset .tabset-fade}
+
+
+```{r}
+rdata2 %>%
+    select(-c('일조', '전운량')) %>% 
+    mutate(time = ymd_hms(time)) -> rdata2 
+    #filter(between(time, ymd('2015-02-01'), ymd('2021-01-31'))) -> rdata2
+
+```
+
+# data split {.tabset .tabset-fade}
+```{r}
+splits <- time_series_split(rdata2, assess = "85 day", cumulative = TRUE)
+
+splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(time, ulsan, .interactive = FALSE)
+
+
+train_df <- training(splits)
+test_df <- testing(splits) 
+
+```
+# Data preprocessing
+
+```{r}
+train_df$ulsan %>% summary()
+train_df %>% 
+    filter(is.na(ulsan))
+
+train_df %>% 
+    mutate(ulsan = ulsan + 1) %>% 
+    mutate(ulsan_boxcox = box_cox_vec(ulsan, lambda = 'auto'))
+
+
+
+model_recipe <- train_df %>% 
+    recipe(ulsan~.) %>% 
+    step_mutate(ulsan = ulsan + 1,
+                ulsan = box_cox_vec(ulsan, lambda = 'auto')) %>%#  lambda: 0.405845932590944
+    step_mutate_at(all_predictors(), -time, fn = as.numeric) %>% 
+    step_normalize(all_numeric_predictors(), -time) %>%
+    step_date(time, features = 'month', ordinal = FALSE) %>% 
+    step_dummy(time_month) %>% 
+    prep(training = train_df) 
+
+train2 <- juice(model_recipe)
+test2 <- bake(model_recipe, new_data = test_df)
+
+```
+
+# time series workflow {.tabset .tabset-fade}
+## Model fitting 
+```{r}
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_fit_prophet <- workflow() %>% 
+    add_model(model_fit_prophet) %>% 
+    add_recipe(model_recipe) %>% 
+    fit(train2) # Using value for lambda: 1.21137725464052
+
+
+
+model_fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_fit_prophet_boost <- workflow() %>% 
+    add_model(model_fit_prophet_xgboost) %>% 
+    add_recipe(model_recipe) %>% 
+    fit(train2)
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_fit_nnetar_boost <- workflow() %>% 
+    add_model(model_fit_nnetar) %>% 
+    add_recipe(model_recipe) %>% 
+    fit(train2)
+
+```
+
+## Model table  
+```{r}
+submodels_tbl <- modeltime_table(
+    model_fit_prophet, 
+    model_fit_prophet_xgboost, 
+    model_fit_nnetar
+)
+```
+
+
+## Model accuracy
+```{r}
+submodels_tbl %>% 
+    modeltime_accuracy(testing(splits)) %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+```
+
+
+## Model ensemble 
+```{r}
+ensemble_fit_avg <- submodels_tbl %>%
+    ensemble_average(type = "mean")
+
+ensemble_fit_avg
+
+
+ensemble_fit_med <- submodels_tbl %>%
+    ensemble_average("median")
+
+ensemble_fit_wt <- submodels_tbl %>%
+    ensemble_weighted(loadings = c(1, 1, 7))
+
+ensemble_models_tbl <- modeltime_table(
+    ensemble_fit_avg,
+    ensemble_fit_med,
+    ensemble_fit_wt
+)
+
+ensemble_models_tbl %>%
+    modeltime_accuracy(testing(splits)) %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+```
+
+
+```{r}
+
+rdata2 %>% 
+    future_frame(.date_var = time, .length_out = '1 month', .bind_data = T) %>% 
+    tail()
+
+
+ensemble_models_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(splits),
+        actual_data = rdata2
+    ) -> model_forecast
+
+
+
+
+```
+
+
+```{r}
+prophet_boost_spec <- prophet_boost(seasonality_daily = TRUE
+    trees = 1000,  
+    learn_rate = tune()) %>%
+    set_engine(engine = "prophet_xgboost")
+
+
+grid <- prophet_boost_spec %>% 
+    parameters() %>% 
+    grid_regular(levels = 10)
+
+set.seed(2893)
+regular_grid <-
+  prophet_boost_spec %>%
+  tune_grid(
+    ulsan ~ time + as.numeric(time) + as.numeric(기온) +
+          as.numeric(강수) + as.numeric(풍속) + as.numeric(풍향) +
+          as.numeric(습도) + as.numeric(증기압) + as.numeric(이슬점) + 
+          as.numeric(기압) + as.numeric(해면기압) + as.numeric(일사) + 
+          as.numeric(시정) + as.numeric(지면온도),
+    resamples = resample_spec,
+    grid = grid,
+    control = control_grid(save_pred = TRUE)
+  )
+
+
+prophet_boost_wf <- workflow() %>% 
+    add_formula(ulsan~.) %>% 
+    add_model(prophet_boost_spec)
+
+
+prophet_boost_grid <- grid_latin_hypercube(
+    tree_depth(), 
+    min_n(), 
+    loss_reduction(), 
+    sample_size = sample_prop(), 
+    finalize(mtry(), train_df), 
+    learn_rate(), 
+    size = 30
+)
+
+resample_spec <- time_series_cv(data = rdata2,
+                                date_var = time,
+                                initial     = "1 years",
+                                assess      = "5 months",
+                                skip        = "3 months",
+                                slice_limit = 3)
+
+library(tictoc)
+tic()
+doParallel::registerDoParallel()
+set.seed(1234)
+
+prophet_boost_res <- tune_grid(
+    prophet_boost_wf,  
+    resamples = resample_spec, 
+    grid = prophet_boost_grid, 
+    control = control_grid(save_pred = TRUE) 
+)
+toc()  
+
+prophet_boost_res$.notes
+
+```
+
+
+
