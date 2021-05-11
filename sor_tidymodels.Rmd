@@ -108,16 +108,6 @@ test_df <- testing(splits)
 # Data preprocessing
 
 ```{r}
-train_df$ulsan %>% summary()
-train_df %>% 
-    filter(is.na(ulsan))
-
-train_df %>% 
-    mutate(ulsan = ulsan + 1) %>% 
-    mutate(ulsan_boxcox = box_cox_vec(ulsan, lambda = 'auto'))
-
-
-
 model_recipe <- train_df %>% 
     recipe(ulsan~.) %>% 
     step_mutate(ulsan = ulsan + 1,
@@ -167,12 +157,30 @@ wflw_fit_nnetar_boost <- workflow() %>%
 
 ## Model table  
 ```{r}
-submodels_tbl <- modeltime_table(
-    model_fit_prophet, 
-    model_fit_prophet_xgboost, 
-    model_fit_nnetar
+model_table <- modeltime_table(
+  wflw_fit_prophet, 
+  wflw_fit_prophet_boost, 
+  wflw_fit_nnetar_boost
 )
 ```
+
+## calibration 
+
+```{r}
+calibration_table <- model_table %>% 
+  modeltime_calibrate(testing(splits))
+
+calibration_table
+
+
+full_data <- bind_rows(train2, test2)
+
+calibration_table %>% 
+  modeltime_forecast(actual_data = full_data) %>% 
+  plot_modeltime_forecast(.interactive=FALSE)
+
+```
+
 
 
 ## Model accuracy
