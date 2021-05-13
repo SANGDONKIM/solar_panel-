@@ -40,6 +40,7 @@ library(timetk)
 library(lubridate)
 library(janitor)
 library(tidyquant)
+library(sknifedatar)
 
 # Visualization
 library(ggthemes)
@@ -65,7 +66,7 @@ rdata <- fread(file.path(file_path, "rdata.csv"))
 
 # Data overview (데이터 기본정보) {.tabset .tabset-fade}
 
-## train data
+## data
 
 ```{r}
 head(rdata)
@@ -81,23 +82,515 @@ rdata %>%
     select(-hour) %>% 
     mutate(time = ymd_hms(time)) %>% 
     filter(between(time, ymd('2018-03-01'), ymd('2021-01-31'))) -> rdata
-
-rdata %>% glimpse()
-
+rdata %>% glimpse()  
 rdata %>% 
   summarise(across(.fns = ~sum(is.na(.))/length(.)))
 
-rdata %>% 
-    select(-c(warehouse, dangjin, ulsan)) -> floating
-    
-rdata %>% 
-    select(-c(floating, dangjin, ulsan)) -> warehouse
+```
 
-rdata %>% 
-    select(-c(floating, warehouse, ulsan)) -> dangjin
+# 단변량 시계열
+```{r}
+ulsan <- rdata %>% 
+  select(-c(dangjin, warehouse, floating)) %>% 
+  select(time, ulsan) %>% 
+  rename(date = time, value = ulsan)
+```
 
-rdata %>% 
-    select(-c(floating, warehouse, dangjin)) -> ulsan
+```{r}
+initial_time_split(data = ulsan, prop = 0.9) %>% 
+  tk_time_series_cv_plan() %>% # Converts the splits object to a data frame
+  plot_time_series_cv_plan(date, value, #  Plots the time series sampling data using the “date” and “value” columns
+                           .interact = FALSE, 
+                           .title = "Partition Train / Test")
+
+```
+
+# recipe
+
+```{r}
+recipe_base <- recipe(value~date, data = ulsan) # 전처리 없을 때 
+
+recipe_date_features <- recipe_base %>% step_date(date, features = c('dow','month','year')) # day of week, month, year 변수 추가 
+
+recipe_date_extrafeatures <- recipe_date_features %>% 
+  step_date(date, features = c('quarter','semester')) # quarter, semester 추가 
+
+recipe_date_extrafeatures_lag <- recipe_date_extrafeatures %>% 
+  step_lag(value, lag = 1:6) %>% # lag variable 추가 
+  step_ts_impute(all_numeric(), period=365) # NA값일 경우 대체 
+
+recipe_date_extrafeatures_fourier <-recipe_date_extrafeatures  %>% 
+  step_fourier(date, period = 365/12, K = 1) # 푸리에 변환 적용? 
+```
+
+
+# Model 
+
+* auto_arima_boost: a automatic ARIMA boosted model specification
+* prophet_boost: a prophet model specification
+* prophet_boost_log: a prophet model specification with logarithmic growth
+* mars: a Multivariate Adaptive Regression Splines model specification
+* nnetar: a Neural network time series model specification
+
+
+```{r}
+prophet_boost <- 
+  prophet_boost(mode = 'regression') %>% set_engine("prophet_xgboost")
+
+# prophet_xgboost logistic
+prophet_boost_log <-
+  prophet_boost(
+    mode = 'regression',
+    changepoint_range = 0.8,
+    logistic_floor = min(ulsan$value),
+    logistic_cap = max(ulsan$value),
+    growth = 'logistic'
+  ) %>%
+  set_engine("prophet_xgboost")
+
+mars <- mars( mode = 'regression') %>% set_engine('earth')
+
+nnetar <- nnetar_reg() %>% set_engine("nnetar")
+
+auto_arima_boost <- modeltime::arima_boost() %>% set_engine('auto_arima_xgboost')
+```
+
+# workflowsets
+recipe를 여러번 적용하고 싶을 때 사용.
+모든 가능한 recipe와 모델의 조합을 전부 적합시킬 수 있음. 
+
+공식문서를 보면 전처리 recipe, filter recipe, pca 등을 따로 취급하고 여러 모델에 가능한 workflow 조합을 시험해볼 수 있음 
+
+
+공식 문서 링크 
+https://github.com/tidymodels/workflowsets
+```{r}
+wfsets <- workflow_set(
+  preproc = list(
+    base                  = recipe_base,
+    features              = recipe_date_features, 
+    extrafeatures         = recipe_date_extrafeatures,
+    extrafeatures_lag     = recipe_date_extrafeatures_lag,
+    extrafeatures_fourier = recipe_date_extrafeatures_fourier
+  ),
+  models  = list(
+    M_arima_boost       = auto_arima_boost,
+    M_prophet_boost_log = prophet_boost_log, 
+    M_prophet_boost     = prophet_boost,
+    M_mars              = mars,
+    M_nnetar            = nnetar
+  ),
+  cross   = TRUE # 모든 가능한 조합을 시험할지 여부 
+  # A logical: should all combinations of the preprocessors and models be used to create the workflows? If FALSE, the length of preproc and models should be equal.
+
+) 
+
+wfsets
+```
+## 특정 모델을 제외할 때 
+nnetar, mars는 lag를 포함한 recipe에 유의하지 않기 때문에 제외할 필요가 있음. 특정 모델을 제거할 때 anti_join 사용?
+
+anti_join(x, y) : y 데이터 프레임에는 매칭되지 않지만 x 데이터프레임에는 있는 칼럼을 반환 
+
+관련 링크 
+https://statkclee.github.io/data-science/ds-dplyr-join.html
+
+```{r}
+wfsets <- wfsets %>% 
+  anti_join(
+    tibble(wflow_id = c("extrafeatures_lag_M_nnetar", 
+                        "extrafeatures_lag_M_mars")), 
+            by = "wflow_id")
+
+```
+
+
+# model fit 
+
+sknifedatar 패키지에 있는 modeltime_wfs_fit 함수를 통해서 시계열 워크플로우를 포함한 워크플로우 셋을 피팅할 수 있음. 
+워크플로우셋에서 지정한 가능한 recipe와 모델의 조합에 대한 다양한 평가 지표를 저장함 
+
+
+
+```{r}
+set.seed(20210508)
+split_prop <- 0.9
+wffits <- modeltime_wfs_fit(.wfsets = wfsets, # workflow set 
+                            .split_prop = split_prop, 
+                            .serie=ulsan)
+```
+
+```{r}
+wffits
+```
+# forecast on test data 
+
+이전에 분할한 test set에 대한 예측은 sknifedatar::modeltime_wfs_forecast 함수를 통해 할 수 있음. 
+
+```{r}
+modeltime_wfs_forecast(.wfs_results = wffits, 
+                       .serie = ulsan, 
+                       .split_prop=split_prop) %>% 
+  plot_modeltime_forecast(.interactive=FALSE)+
+  theme(legend.direction = 'vertical')
+
+```
+
+
+# model ranking 
+modeltime_wfs_fit에서 생성한 모델 중 top 모델을 결정할 수 있음 
+sknifedatar::modeltime_wfs_rank() 함수를 이용해서 수행함
+
+```{r}
+ranking <- modeltime_wfs_rank(wffits,
+                              rank_metric = "mae", 
+                              minimize = TRUE) # metric에 대해 minimize로 세팅할건지 boolean
+ranking
+```
+
+
+
+# best model 
+
+```{r}
+wffits_best <- modeltime_wfs_bestmodel(.wfs_results = ranking, # modeltime_wfs_rank 함수 지정  
+                                      .model = "top 4", # top n 
+                                      .metric = "mae", 
+                                      .minimize = TRUE)
+wffits_best
+```
+
+
+
+# forecast on test 
+
+```{r}
+modeltime_wfs_forecast(.wfs_results = wffits_best, 
+                       .serie = ulsan, 
+                       .split_prop=split_prop) %>% 
+  plot_modeltime_forecast(.interactive=FALSE)
+
+```
+
+# model refit 
+전체 데이터셋에 대해 model을 refit할 수 있음 
+
+```{r}
+wfrefits <- modeltime_wfs_refit(.wfs_results = wffits_best, .serie = ulsan)
+wfrefits
+```
+
+
+# future forecast 
+```{r}
+wfrefits_forecast <- modeltime_wfs_forecast(.wfs_results = wfrefits, 
+                                            .serie = ulsan, 
+                                            .h = '1 month',
+                                            .split_prop = split_prop) 
+
+wfrefits_forecast %>% 
+  plot_modeltime_forecast(.interactive=FALSE) +
+  theme(legend.direction = 'vertical')
+
+```
+
+
+
+# workflow set 이용안하고 바로 적합할 때 
+
+링크 참고 
+https://cran.r-project.org/web/packages/modeltime/vignettes/getting-started-with-modeltime.html
+
+https://www.adam-d-mckinnon.com/posts/2020-10-10-forecastpeopleanalytics/
+
+
+```{r}
+months <- 1
+
+total_months <- lubridate::interval(base::min(ulsan$date),
+                                    base::max(ulsan$date)) %/%  
+                                    base::months(1)
+
+
+# determine the proportion for the test split
+prop <- (total_months - months) / total_months
+
+# Train/Test Split
+splits <- rsample::initial_time_split(ulsan, prop = prop)
+
+# Plot splits as sanity check
+splits %>%
+  timetk::tk_time_series_cv_plan() %>%  
+  timetk::plot_time_series_cv_plan(date, value) 
+
+```
+
+# Modeling
+
+각 모델에 튜닝 파라미터가 있음. 
+모델별로 확인하고 원래 tidymodels에서 했던 것처럼 튜닝이 필요함 
+
+
+```{r}
+
+# Exponential smoothing 
+model_fit_ets <- modeltime::exp_smoothing() %>%
+    parsnip::set_engine(engine = "ets") %>%
+    parsnip::fit(value ~ date, data = training(splits))
+
+
+# ARIMA 
+model_fit_arima <- modeltime::arima_reg() %>%
+    parsnip::set_engine("auto_arima") %>%
+    parsnip::fit(
+        value ~ date, 
+        data = training(splits))
+
+
+# ARIMA Boost
+model_fit_arima_boost <- modeltime::arima_boost() %>%
+    parsnip::set_engine("auto_arima_xgboost") %>%
+    parsnip::fit(
+        value ~ date + as.numeric(date) + month(date, label = TRUE), 
+        data = training(splits))
+
+# Prophet
+model_fit_prophet <- modeltime::prophet_reg() %>%
+    parsnip::set_engine("prophet") %>%
+    parsnip::fit(
+        value ~ date, 
+        data = training(splits))
+
+
+# Prophet Boost
+model_fit_prophet_boost <- modeltime::prophet_boost() %>%
+    parsnip::set_engine("prophet_xgboost") %>%
+    parsnip::fit(
+        value ~ date + as.numeric(date) + month(date, label = TRUE), 
+        data = training(splits))
+```
+
+
+
+# Model time table 
+
+modeltime_table에 피팅한 모델을 추가함. 
+modeltime_table은 각 모델이 재대로 적합되었는지 확인하고, 이후 예측 워크플로우를 위해서 modeltime_table 구조를 이용함 
+
+```{r}
+model_tbl <- modeltime::modeltime_table(
+    model_fit_ets,
+    model_fit_arima,
+    model_fit_arima_boost,
+    model_fit_prophet,
+    model_fit_prophet_boost)
+
+model_tbl
+```
+
+# calibration 
+
+이전에 만든 modeltime_table을 test 데이터에 적합시켜서 보정을 함
+
+* Calibration is how confidence intervals and accuracy metrics are determined
+* Calibration Data is simply forecasting predictions and residuals that are calculated from out-of-sample data.
+* After calibrating, the calibration data follows the data through the
+forecasting workflow.
+
+```{r}
+calibration_tbl <- model_tbl %>%
+    modeltime::modeltime_calibrate(testing(splits))  
+```
+
+
+```{r}
+calibration_tbl %>%
+    modeltime::modeltime_accuracy() %>%   
+    flextable::flextable() %>% 
+    flextable::bold(part = "header") %>% 
+    flextable::bg(bg = "#D3D3D3", part = "header") %>% 
+    flextable::autofit()
+```
+
+# visualization the forecast test 
+
+```{r}
+calibration_tbl %>%
+    modeltime::modeltime_forecast(new_data = testing(splits), 
+                                  actual_data = ulsan,
+                                  conf_interval = 0.90) %>%
+    modeltime::plot_modeltime_forecast(.legend_show = TRUE, 
+                                       .legend_max_width = 20)
+```
+
+
+# refit
+```{r}
+refit_tbl <- calibration_tbl %>%
+    modeltime::modeltime_refit(data = ulsan)
+```
+
+
+
+# forecast 
+```{r}
+forecast_tbl <- refit_tbl %>%
+    modeltime::modeltime_forecast(
+        h = "1 month",
+        actual_data = ulsan,
+        conf_interval = 0.90
+    ) 
+
+forecast_tbl %>%
+    modeltime::plot_modeltime_forecast(.interactive = TRUE,
+                                       .legend_max_width = 20)
+```
+
+
+# aggregate model 
+정확도 향상을 위해서 5개 모델의 예측값을 평균 냄 
+
+```{r}
+mean_forecast_tbl <- forecast_tbl %>%
+    dplyr::filter(.key != "actual") %>%
+    dplyr::group_by(.key, .index) %>%
+    dplyr::summarise(across(.value:.conf_hi, mean)) %>%
+    dplyr::mutate(
+        .model_id   = 6,
+        .model_desc = "AVERAGE OF MODELS"
+    )
+
+
+# Visualize aggregate model 
+forecast_tbl %>%
+    dplyr::filter(.key == "actual") %>%
+    dplyr::bind_rows(mean_forecast_tbl) %>%
+    modeltime::plot_modeltime_forecast()  
+```
+
+
+# H2O 패키지 소개 
+
+자동으로 모델 구성 가능 
+
+로직은 modeltime 패키지와 동일 
+
+https://www.r-bloggers.com/2021/03/introducing-modeltime-h2o-automatic-forecasting-with-h2o-automl/
+
+
+
+# gluonTS 
+
+링크 참고 
+
+https://cran.r-project.org/web/packages/modeltime.gluonts/vignettes/getting-started.html#references
+
+```{r}
+library(modeltime.gluonts)
+install_gluonts()
+```
+
+```{r}
+ulsan %>% 
+  mutate(value = standardize_vec(value)) -> data
+```
+
+# generate future dataframe 
+```{r}
+HORIZON <- 24*30
+
+new_data <- data %>%
+  future_frame(.length_out = HORIZON) 
+
+```
+
+
+```{r}
+model_fit_nbeats_ensemble <- nbeats(
+  id                    = "id",
+  freq                  = "H",
+  prediction_length     = HORIZON,
+  lookback_length       = c(HORIZON, 4*HORIZON),
+  epochs                = 5,
+  num_batches_per_epoch = 15,
+  batch_size            = 1 
+) %>%
+  set_engine("gluonts_nbeats_ensemble") %>%
+  fit(value ~ date + id, data)
+
+model_fit_nbeats_ensemble
+```
+
+
+
+```{r}
+modeltime_forecast_tbl <- modeltime_table(
+  model_fit_nbeats_ensemble
+) %>%
+  modeltime_forecast(
+    new_data    = new_data,
+    actual_data = data,
+    keep_data   = TRUE
+  ) 
+```
+
+
+```{r}
+modeltime_forecast_tbl %>%
+  plot_modeltime_forecast(
+    .conf_interval_show = FALSE, 
+    .interactive        = FALSE
+  )
+```
+
+
+
+
+
+
+
+
+
+```{r}
+ulsan <- recipe(ulsan ~ . , data = ulsan) %>%
+    step_ts_impute('증기압', '이슬점', '해면기압', '기압', '일조', '전운량', lambda = 'auto') %>% 
+  prep() %>% 
+  juice() %>% is.na() %>% colSums()
+
+recipe_book %>% prep() %>% juice() %>% glimpse()
+
+
+
+
+log_y <- rdata %>% 
+  mutate(floating_log = log(floating), 
+         warehouse_log = log(warehouse), 
+         dangjin_log = log(dangjin), 
+         ulsan_log = log(ulsan)
+         ) 
+
+log_y %>% 
+  summarise(floating_std_mean = mean(floating_log), 
+            floating_std_mean = format(round(floating_std_mean, 13), nsmall = 13), 
+            floating_std_sd = sd(floating_log), 
+            floating_std_sd = format(round(floating_std_sd, 13), nsmall = 13),
+            
+            warehouse_std_mean = mean(warehouse_log), 
+            warehouse_std_mean = format(round(warehouse_std_mean, 13), nsmall = 13), 
+            warehouse_std_sd = sd(warehouse_log), 
+            warehouse_std_sd = format(round(warehouse_std_sd, 13), nsmall = 13),
+            dangjin_std_mean = mean(dangjin_log), 
+            dangjin_std_mean = format(round(dangjin_std_mean, 13), nsmall = 13), 
+            dangjin_std_sd = sd(dangjin_log), 
+            dangjin_std_sd = format(round(dangjin_std_sd, 13), nsmall = 13),
+            
+            ulsan_std_mean = mean(ulsan_log), 
+            ulsan_std_mean = format(round(ulsan_std_mean, 13), nsmall = 13), 
+            ulsan_std_sd = sd(ulsan_log), 
+            ulsan_std_sd = format(round(ulsan_std_sd, 13), nsmall = 13)
+            ) -> inversion_values
+
+inversion_values
 
 ```
 
@@ -141,7 +634,7 @@ Summary of the feature engineering process:
 * yday: Day of the year
 
 ```{r}
-ulsan %>% 
+rdata %>% 
     tk_augment_timeseries_signature()
 ```
 
@@ -154,6 +647,8 @@ ulsan %>%
     select(time, ulsan, ulsan_transformed, everything()) -> prepared_hourly_tbl
 
 ```
+
+
 ```{r}
 prepared_hourly_tbl %>% glimpse()
 ```

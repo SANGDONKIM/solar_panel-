@@ -1,0 +1,510 @@
+---
+title: "solar panel data analysis"
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 5
+    fig_height: 4
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+```
+
+# Preparations (준비작업) {.tabset .tabset-fade}
+
+## Libraries
+
+```{r load_lib, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(data.table)
+library(skimr)
+library(tibble)
+library(tibbletime)
+library(timetk)
+library(imputeTS)
+library(anomalize)
+library(forecast)
+library(GGally)
+library(modeltime)
+library(gt)
+library(timetk)
+library(lubridate)
+library(janitor)
+library(tidyquant)
+library(modeltime.resample)
+library(modeltime.ensemble)
+
+# Visualization
+library(ggthemes)
+library(ggsci)
+library(viridis)
+library(ggExtra)
+
+
+theme_set(theme_bw())
+```
+
+## Data load {.tabset .tabset-fade}
+
+```{r}
+file_path <- "./data/"
+files <- list.files(file_path)
+files
+```
+
+```{r, message=FALSE}
+rdata1 <- fread(file.path(file_path, "rdata1.csv"))
+rdata2 <- fread(file.path(file_path, "rdata2.csv"))
+
+```
+
+# Data overview (데이터 기본정보) {.tabset .tabset-fade}
+
+## train data
+
+```{r}
+glimpse(rdata1)
+skim(rdata1)
+
+glimpse(rdata2)
+skim(rdata2)
+
+```
+
+# 데이터 전처리 {.tabset .tabset-fade}
+
+## 일조, 전운량 제거 
+```{r}
+rdata2 %>%
+    dplyr::select(-c('일조', '전운량')) %>% 
+    mutate(time = ymd_hms(time)) -> rdata2 
+    #filter(between(time, ymd('2015-02-01'), ymd('2021-01-31'))) -> rdata2
+```
+
+
+## transform standardization 
+
+```{r}
+rdata2 %>% 
+    mutate(ulsan = standardize_vec(ulsan)) -> rdata2
+
+#Standardization Parameters
+#mean: 66.3113618827161
+#standard deviation: 104.187665325827
+```
+
+
+
+
+
+# data split {.tabset .tabset-fade}
+```{r}
+complete_prepared_tbl <- rdata2 %>% 
+    filter(between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+forecast_tbl <- rdata2 %>% 
+    filter(!between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+
+splits <- time_series_split(rdata2, assess = "85 day", cumulative = TRUE)
+
+```
+
+# Feature engineering
+
+```{r}
+model_recipe <- 
+    recipe(ulsan~., data = training(splits)) %>% 
+    step_mutate_at(all_predictors(), -time, fn = as.numeric) %>% 
+    step_normalize(all_numeric_predictors(), -time) %>%
+    step_date(time, features = 'month', ordinal = FALSE) %>% 
+    step_dummy(time_month) 
+
+
+```
+
+# time series workflow {.tabset .tabset-fade}
+## Model fitting 
+```{r}
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_fit_prophet <- workflow() %>% 
+    add_recipe(model_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits)) 
+
+
+
+model_fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_fit_prophet_boost <- workflow() %>% 
+    add_recipe(model_recipe) %>%
+    add_model(model_fit_prophet_xgboost) %>% 
+    fit(training(splits))
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_fit_nnetar_boost <- workflow() %>% 
+    add_recipe(model_recipe) %>% 
+    add_model(model_fit_nnetar) %>% 
+    fit(training(splits))
+
+```
+
+## Model table  
+```{r}
+model_tbl <- modeltime_table(
+  wflw_fit_prophet, 
+  wflw_fit_prophet_boost, 
+  wflw_fit_nnetar_boost
+)
+```
+
+## calibration 
+
+```{r}
+calibration_tbl <- model_tbl %>% 
+  modeltime_calibrate(new_data = testing(splits))
+
+```
+
+## refit
+```{r}
+refit_tbl <- calibration_tbl %>% 
+    modeltime_refit(data = complete_prepared_tbl) 
+
+```
+
+```{r}
+refit_tbl %>% 
+    modeltime_forecast(
+        new_data = forecast_tbl, 
+        actual_data = complete_prepared_tbl 
+    ) %>% 
+    mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 66.3113618827161,
+        sd = 104.187665325827
+    ))) -> result_tbl
+
+
+#mean: 66.3113618827161
+#standard deviation: 104.187665325827
+    
+```
+
+# dangjin 
+
+```{r}
+rdata1 %>%
+    dplyr::select(-c('일조', '전운량', 'floating', 'warehouse')) %>% 
+    mutate(time = ymd_hms(time)) -> dangjin_data 
+
+dangjin_data %>% 
+    mutate(dangjin = standardize_vec(dangjin)) -> dangjin_data
+
+#mean: 140.108302306504
+#standard deviation: 221.666754909259
+
+complete_prepared_dangjin_tbl <- dangjin_data %>% 
+    filter(between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+forecast_dangjin_tbl <- dangjin_data %>% 
+    filter(!between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+
+splits_dangjin <- time_series_split(dangjin_data, assess = "85 day", cumulative = TRUE)
+
+model_dangjin_recipe <- 
+    recipe(dangjin~., data = training(splits_dangjin)) %>% 
+    step_mutate_at(all_predictors(), -time, fn = as.numeric) %>% 
+    step_normalize(all_numeric_predictors(), -time) %>%
+    step_date(time, features = 'month', ordinal = FALSE) %>% 
+    step_dummy(time_month) 
+
+
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_dangjin_prophet <- workflow() %>% 
+    add_recipe(model_dangjin_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits_dangjin)) 
+
+
+
+model_fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_dangjin_prophet_boost <- workflow() %>% 
+    add_recipe(model_dangjin_recipe) %>%
+    add_model(model_fit_prophet_xgboost) %>% 
+    fit(training(splits_dangjin))
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_dangjin_nnetar_boost <- workflow() %>% 
+    add_recipe(model_dangjin_recipe) %>% 
+    add_model(model_fit_nnetar) %>% 
+    fit(training(splits_dangjin))
+
+model_dangjin_tbl <- modeltime_table(
+  wflw_dangjin_prophet, 
+  wflw_dangjin_prophet_boost, 
+  wflw_dangjin_nnetar_boost
+)
+
+calibration_dangjin_tbl <- model_dangjin_tbl %>% 
+  modeltime_calibrate(new_data = testing(splits_dangjin))
+
+refit_dangjin_tbl <- calibration_dangjin_tbl %>% 
+    modeltime_refit(data = complete_prepared_dangjin_tbl) 
+
+refit_dangjin_tbl %>% 
+    modeltime_forecast(
+        new_data = forecast_dangjin_tbl, 
+        actual_data = complete_prepared_dangjin_tbl 
+    ) %>% 
+    mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 140.108302306504,
+        sd = 221.666754909259
+    ))) -> result_dangjin_tbl
+
+
+#mean: 140.108302306504
+#standard deviation: 221.666754909259
+```
+
+
+# floating 
+
+```{r}
+rdata1 %>%
+    dplyr::select(-c('일조', '전운량', 'dangjin', 'warehouse')) %>% 
+    mutate(time = ymd_hms(time)) -> floating_data 
+
+floating_data %>% 
+    mutate(floating = standardize_vec(floating)) -> floating_data
+
+#mean: 122.418152421745
+#standard deviation: 192.338227252236
+
+complete_prepared_floating_tbl <- floating_data %>% 
+    filter(between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+forecast_floating_tbl <- floating_data %>% 
+    filter(!between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+
+splits_floating <- time_series_split(floating_data, assess = "85 day", cumulative = TRUE)
+
+model_floating_recipe <- 
+    recipe(floating~., data = training(splits_floating)) %>% 
+    step_mutate_at(all_predictors(), -time, fn = as.numeric) %>% 
+    step_normalize(all_numeric_predictors(), -time) %>%
+    step_date(time, features = 'month', ordinal = FALSE) %>% 
+    step_dummy(time_month) 
+
+
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_floating_prophet <- workflow() %>% 
+    add_recipe(model_floating_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits_floating)) 
+
+
+model_fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_floating_prophet_boost <- workflow() %>% 
+    add_recipe(model_floating_recipe) %>%
+    add_model(model_fit_prophet_xgboost) %>% 
+    fit(training(splits_floating))
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_floating_nnetar_boost <- workflow() %>% 
+    add_recipe(model_floating_recipe) %>% 
+    add_model(model_fit_nnetar) %>% 
+    fit(training(splits_floating))
+
+model_floating_tbl <- modeltime_table(
+  wflw_floating_prophet, 
+  wflw_floating_prophet_boost, 
+  wflw_floating_nnetar_boost
+)
+
+calibration_floating_tbl <- model_floating_tbl %>% 
+  modeltime_calibrate(new_data = testing(splits_floating))
+
+refit_floating_tbl <- calibration_floating_tbl %>% 
+    modeltime_refit(data = complete_prepared_floating_tbl) 
+
+refit_floating_tbl %>% 
+    modeltime_forecast(
+        new_data = forecast_floating_tbl, 
+        actual_data = complete_prepared_floating_tbl 
+    ) %>% 
+    mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 122.418152421745,
+        sd = 192.338227252236
+    ))) -> result_floating_tbl
+
+#mean: 122.418152421745
+#standard deviation: 192.338227252236
+
+```
+
+# warehouse
+
+```{r}
+rdata1 %>%
+    dplyr::select(-c('일조', '전운량', 'dangjin', 'floating')) %>% 
+    mutate(time = ymd_hms(time)) -> warehouse_data 
+
+warehouse_data %>% 
+    mutate(warehouse = standardize_vec(warehouse)) -> warehouse_data
+
+#mean: 95.8136861225766
+#standard deviation: 150.715774412301
+
+complete_prepared_warehouse_tbl <- warehouse_data %>% 
+    filter(between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+forecast_warehouse_tbl <- warehouse_data %>% 
+    filter(!between(time, ymd('2015-02-01'), ymd('2021-02-01')))
+
+
+splits_warehouse <- time_series_split(warehouse_data, assess = "85 day", cumulative = TRUE)
+
+model_warehouse_recipe <- 
+    recipe(warehouse~., data = training(splits_warehouse)) %>% 
+    step_mutate_at(all_predictors(), -time, fn = as.numeric) %>% 
+    step_normalize(all_numeric_predictors(), -time) %>%
+    step_date(time, features = 'month', ordinal = FALSE) %>% 
+    step_dummy(time_month) 
+
+
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_warehouse_prophet <- workflow() %>% 
+    add_recipe(model_warehouse_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits_warehouse)) 
+
+
+model_fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_warehouse_prophet_boost <- workflow() %>% 
+    add_recipe(model_warehouse_recipe) %>%
+    add_model(model_fit_prophet_xgboost) %>% 
+    fit(training(splits_warehouse))
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_warehouse_nnetar_boost <- workflow() %>% 
+    add_recipe(model_warehouse_recipe) %>% 
+    add_model(model_fit_nnetar) %>% 
+    fit(training(splits_warehouse))
+
+model_warehouse_tbl <- modeltime_table(
+  wflw_warehouse_prophet, 
+  wflw_warehouse_prophet_boost, 
+  wflw_warehouse_nnetar_boost
+)
+
+calibration_warehouse_tbl <- model_warehouse_tbl %>% 
+  modeltime_calibrate(new_data = testing(splits_warehouse))
+
+refit_warehouse_tbl <- calibration_warehouse_tbl %>% 
+    modeltime_refit(data = complete_prepared_warehouse_tbl) 
+
+refit_warehouse_tbl %>% 
+    modeltime_forecast(
+        new_data = forecast_warehouse_tbl, 
+        actual_data = complete_prepared_warehouse_tbl 
+    ) %>% 
+    mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 95.8136861225766,
+        sd = 150.715774412301
+    ))) -> result_warehouse_tbl
+
+
+#mean: 95.8136861225766
+#standard deviation: 150.715774412301
+
+```
+
+
+
+
+```{r}
+#write.csv(result_tbl, 'result_tbl.csv')
+#write.csv(result_dangjin_tbl, 'result_dangjin_tbl.csv')
+#write.csv(result_floating_tbl, 'result_floating_tbl.csv')
+#write.csv(result_warehouse_tbl, 'result_warehouse_tbl.csv')
+```
+
+```{r}
+submission <- fread(file.path(file_path, "sample_submission.csv"))
+result_tbl <- fread('result_tbl.csv')
+result_dangjin_tbl <- fread('result_dangjin_tbl.csv')
+result_floating_tbl <- fread('result_floating_tbl.csv')
+result_warehouse_tbl <- fread('result_warehouse_tbl.csv')
+
+a <- result_tbl %>% # ulsan
+  filter(between(.index , ymd('2021-02-01'), ymd('2021-03-01'))) %>% 
+  filter(.model_desc == 'NNAR(1,1,10)[24]', .key == 'prediction') %>% 
+  select(.index, .value)
+
+b <- result_dangjin_tbl %>% # dangjin  
+  filter(between(.index , ymd('2021-02-01'), ymd('2021-03-01'))) %>% 
+  filter(.model_desc == 'NNAR(1,1,10)[24]', .key == 'prediction') %>% 
+  select(.index, .value)
+
+c <- result_floating_tbl %>% # floating
+  filter(between(.index , ymd('2021-02-01'), ymd('2021-03-01'))) %>% 
+  filter(.model_desc == 'NNAR(1,1,10)[24]', .key == 'prediction') %>% 
+  select(.index, .value)
+
+d <- result_warehouse_tbl %>% # warehouse
+  filter(between(.index , ymd('2021-02-01'), ymd('2021-03-01'))) %>% 
+  filter(.model_desc == 'NNAR(1,1,10)[24]', .key == 'prediction') %>% 
+  select(.index, .value)
+
+submission$ulsan[1:672] <- a$.value
+submission$dangjin[1:672] <- b$.value
+submission$dangjin_floating[1:672] <- c$.value
+submission$dangjin_warehouse[1:672] <- d$.value
+
+write.csv(submission, 'nnetar1.csv', row.names = F)
+  
+```
+
+# model ensemble로 적합하기 + test 결과 확인 + 울산 외 지역 채워넣기 

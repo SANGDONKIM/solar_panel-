@@ -1,0 +1,195 @@
+---
+title: "solar panel data analysis"
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 5
+    fig_height: 4
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+```
+
+# Preparations (준비작업) {.tabset .tabset-fade}
+
+## Libraries
+
+```{r load_lib, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(data.table)
+library(skimr)
+library(tibble)
+library(tibbletime)
+library(timetk)
+library(imputeTS)
+library(anomalize)
+library(forecast)
+library(GGally)
+library(modeltime)
+library(gt)
+library(timetk)
+library(lubridate)
+library(janitor)
+library(tidyquant)
+library(sknifedatar)
+
+# Visualization
+library(ggthemes)
+library(ggsci)
+library(viridis)
+library(ggExtra)
+
+
+theme_set(theme_bw())
+```
+
+## Data load
+
+```{r}
+file_path <- "./data/"
+files <- list.files(file_path)
+files
+```
+
+```{r, message=FALSE}
+rdata1 <- fread(file.path(file_path, "rdata1.csv"))
+rdata2 <- fread(file.path(file_path, "rdata2.csv"))
+
+```
+
+# Data overview (데이터 기본정보) {.tabset .tabset-fade}
+
+## data
+
+```{r}
+glimpse(rdata1)
+glimpse(rdata2)
+skim(rdata1)
+skim(rdata2)
+
+```
+
+# 데이터 전처리 {.tabset .tabset-fade}
+
+
+```{r}
+rdata2 %>% 
+    mutate(time = ymd_hms(time)) %>% 
+    filter(between(time, ymd('2018-03-01'), ymd('2021-01-31'))) -> rdata2
+  
+rdata2 %>% 
+  summarise(across(.fns = ~sum(is.na(.))/length(.)))
+
+```
+
+
+# data split 
+
+```{r}
+splits <- time_series_split(rdata2, assess = "1 month", cumulative = TRUE)
+
+splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(time, ulsan, .interactive = FALSE)
+
+
+train_df <- training(splits)
+test_df <- testing(splits)
+```
+
+# Modeling
+
+
+```{r}
+# ARIMA Boost
+model_fit_arima_boost <- modeltime::arima_boost() %>%
+    parsnip::set_engine("auto_arima_xgboost") 
+
+
+```
+
+
+# Model time table 
+
+modeltime_table에 피팅한 모델을 추가함. 
+modeltime_table은 각 모델이 재대로 적합되었는지 확인하고, 이후 예측 워크플로우를 위해서 modeltime_table 구조를 이용함 
+
+```{r}
+model_tbl <- modeltime::modeltime_table(
+    model_fit_ets,
+    model_fit_arima,
+    model_fit_arima_boost,
+    model_fit_prophet,
+    model_fit_prophet_boost)
+
+model_tbl
+```
+
+# calibration 
+
+이전에 만든 modeltime_table을 test 데이터에 적합시켜서 보정을 함
+
+* Calibration is how confidence intervals and accuracy metrics are determined
+* Calibration Data is simply forecasting predictions and residuals that are calculated from out-of-sample data.
+* After calibrating, the calibration data follows the data through the
+forecasting workflow.
+
+```{r}
+calibration_tbl <- model_tbl %>%
+    modeltime::modeltime_calibrate(testing(splits))  
+```
+
+
+```{r}
+calibration_tbl %>%
+    modeltime::modeltime_accuracy() %>%   
+    flextable::flextable() %>% 
+    flextable::bold(part = "header") %>% 
+    flextable::bg(bg = "#D3D3D3", part = "header") %>% 
+    flextable::autofit()
+```
+
+# visualization the forecast test 
+
+```{r}
+calibration_tbl %>%
+    modeltime::modeltime_forecast(new_data = testing(splits), 
+                                  actual_data = ulsan,
+                                  conf_interval = 0.90) %>%
+    modeltime::plot_modeltime_forecast(.legend_show = TRUE, 
+                                       .legend_max_width = 20)
+```
+
+
+# refit
+```{r}
+refit_tbl <- calibration_tbl %>%
+    modeltime::modeltime_refit(data = ulsan)
+```
+
+
+
+# forecast 
+```{r}
+forecast_tbl <- refit_tbl %>%
+    modeltime::modeltime_forecast(
+        h = "1 month",
+        actual_data = ulsan,
+        conf_interval = 0.90
+    ) 
+
+forecast_tbl %>%
+    modeltime::plot_modeltime_forecast(.interactive = TRUE,
+                                       .legend_max_width = 20)
+```
+
+
