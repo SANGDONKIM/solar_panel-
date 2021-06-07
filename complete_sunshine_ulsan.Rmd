@@ -1,0 +1,386 @@
+---
+title: "solar panel data analysis (ulsan)"
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 5
+    fig_height: 4
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+# Preparations (준비작업)
+
+## Libraries
+
+```{r load_lib, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(data.table)
+library(skimr)
+library(tibble)
+library(tibbletime)
+library(timetk)
+library(forecast)
+library(modeltime)
+library(gt)
+library(timetk)
+library(lubridate)
+library(janitor)
+library(tidyquant)
+library(modeltime.resample)
+library(modeltime.ensemble)
+
+# Visualization
+library(ggthemes)
+library(ggsci)
+library(viridis)
+library(ggExtra)
+
+
+theme_set(theme_bw())
+```
+
+## Data load
+
+```{r}
+file_path <- "./data/"
+files <- list.files(file_path)
+files
+```
+
+```{r, message=FALSE}
+rdata2 <- fread(file.path(file_path, "rdata2.csv"))
+rdata1 <- fread(file.path(file_path, "rdata1.csv"))
+```
+
+# 데이터 분석 프로세스
+
+1.  단변량 시계열 모델로 2월 일사량 예측
+
+    -   recursive model 추가
+
+2.  단변량 시계열 모델로 2월 기온 예측
+
+    -   recursive model 추가
+
+3.  예측 변수를 기준으로 다변량 시계열 모형 구축
+
+# 단변량 시계열 모델로 2월 일사량 예측
+
+## Change data type
+
+```{r}
+rdata2 %>%
+    dplyr::select(time, 일사) %>% 
+    mutate(time = ymd_hms(time)) %>% 
+    rename(date = time, value = 일사) %>%  
+    dplyr::filter(between(date, ymd('2015-02-01'), ymd('2021-02-01'))) -> sunshine
+```
+
+## Generate future frame
+
+```{r}
+future_tbl <- 
+    future_frame(.data = sunshine,
+                 .date_var = date,
+                 .length_out = '1 month', 
+                 .bind_data  = TRUE) 
+    
+
+
+```
+
+## Standardization
+
+```{r}
+sunshine %>% 
+    mutate(value = standardize_vec(value)) -> sunshine
+
+# Standardization Parameters
+# mean: 0.466097481913728
+# standard deviation: 0.733868279433478
+```
+
+## Data split
+
+```{r}
+splits <- time_series_split(sunshine, assess = "1 month", cumulative = TRUE)
+splits %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, value,
+                           .interact = FALSE, 
+                           .title = "Partition Train / Test")
+```
+
+# Feature engineering
+
+```{r}
+solar_recipe <- 
+    recipe(value~., data = training(splits)) %>% 
+    step_timeseries_signature(date) %>% 
+    step_rm(matches("(iso)|(xts)|(quarter)|(year)|(month)|(qday)|(diff)")) %>% 
+    # step_lag(value, lag = c(24, 168, 720)) %>% 
+    # step_ts_impute(starts_with('lag_'), lambda = 'auto', period = 6) %>% 
+    step_normalize(matches("(index.num)|(yday)")) %>%
+    step_dummy(all_nominal(), one_hot = TRUE) %>%
+    step_interact(~ matches("am.pm") * matches("wday.lbl")) %>%
+    step_fourier(date, period = c(24, 48, 72), K=2)
+    
+solar_recipe %>% prep() %>% juice()
+
+```
+
+# Time series workflow
+
+## Model fitting
+
+<https://stackoverflow.com/questions/66032041/why-should-the-models-used-by-modeltime-table-be-adjusted-on-the-training-data-w>
+
+```{r}
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_fit_prophet <- workflow() %>% 
+    add_recipe(solar_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits)) 
+
+
+```
+
+```{r}
+model_fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") 
+
+wflw_fit_prophet <- workflow() %>% 
+    add_recipe(solar_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits)) 
+
+
+model_fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_fit_prophet_boost <- workflow() %>% 
+    add_recipe(solar_recipe) %>%
+    add_model(model_fit_prophet_xgboost) %>% 
+    fit(training(splits))
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_fit_nnetar <- workflow() %>% 
+    add_recipe(solar_recipe) %>% 
+    add_model(model_fit_nnetar) %>% 
+    fit(training(splits))
+
+
+# model_fit_svm <- svm_poly() %>% 
+#   set_engine("kernlab") %>% 
+#   set_mode("regression")
+# 
+# wflw_fit_svm <- workflow() %>% 
+#     add_recipe(solar_recipe) %>% 
+#     add_model(model_fit_svm) %>% 
+#     fit(training(splits))
+
+
+# model_fit_arima_boosted <- arima_boost(
+#     learn_rate = 0.01
+# ) 
+# 
+# wflw_fit_arboost <- workflow() %>% 
+#     add_recipe(solar_recipe) %>% 
+#     add_model(model_fit_arima_boosted) %>% 
+#     fit(training(splits))
+
+
+
+```
+
+## Model table
+```{r}
+model_tbl <- modeltime_table(
+  wflw_fit_prophet, 
+  wflw_fit_prophet_boost, 
+  wflw_fit_nnetar
+)
+```
+
+## Calibration
+
+```{r}
+calibration_tbl <- model_tbl %>% 
+  modeltime_calibrate(new_data = testing(splits))
+```
+
+```{r}
+calibration_tbl %>% 
+    modeltime_accuracy(testing(splits)) %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+```
+
+## Refit
+
+```{r}
+refit_tbl <- calibration_tbl %>% 
+    modeltime_refit(data = sunshine) 
+```
+
+## Forecast
+
+```{r}
+refit_tbl %>% 
+    modeltime_forecast(
+        new_data = future_tbl, 
+        actual_data = sunshine 
+    ) %>% 
+    mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 0.466097481913728,
+        sd = 0.733868279433478
+    ))) -> result_tbl
+
+#write.csv(result_tbl, 'result_tbl.csv')
+
+# Standardization Parameters
+# mean: 0.466097481913728
+# standard deviation: 0.733868279433478
+    
+```
+
+# Ensemble workflow
+
+## Make an ensemble average
+
+```{r}
+
+ensemble_average_fit <- model_tbl %>% 
+    ensemble_average(type = 'mean') %>% 
+    modeltime_table() %>% 
+    modeltime_calibrate(testing(splits))
+
+ensemble_average_fit %>% 
+    modeltime_accuracy(testing(splits)) %>%
+    table_modeltime_accuracy(.interactive = FALSE) 
+
+```
+
+## Refit on Full Data & Forecast Future
+
+
+```{r}
+
+refit_ensemble_average_fit <- ensemble_average_fit %>% 
+    modeltime_refit(sunshine)
+
+
+refit_ensemble_average_fit %>% 
+    modeltime_forecast(
+        new_data = future_tbl,
+        actual_data = sunshine
+    ) %>% mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 0.466097481913728,
+        sd = 0.733868279433478
+    ))) -> ensemble_average_result 
+
+write.csv(ensemble_average_result, 'ensemble_average_result.csv')
+
+# Standardization Parameters
+# mean: 0.466097481913728
+# standard deviation: 0.733868279433478
+```
+
+# 시각화 
+
+```{r}
+rdata2 %>% 
+    ggplot() + geom_line(aes(x = time, y = 일사), color = 'blue') + 
+    geom_line(data = ensemble_average_result, aes(x = .index, y = .value), color = 'red')
+
+```
+
+
+# Recursive model 
+
+```{r}
+lag_roll_transformer <- function(data){
+    data %>%
+        tk_augment_lags(value, .lags = 1:30*24) #%>% # 시간대별 lag 변수 생성 
+}
+sunshine_lagged <- lag_roll_transformer(future_tbl)
+
+train_data <- sunshine_lagged %>%
+    filter(!is.na(value)) %>%
+    drop_na()
+
+train_data %>% tail()
+
+future_data <- sunshine_lagged %>%
+    filter(is.na(value))
+
+future_data %>% tail()
+
+```
+
+
+```{r}
+fit_prophet <- prophet_reg(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet") %>% 
+    fit(value~., data = train_data)
+
+fit_prophet_xgboost <- prophet_boost(seasonality_daily = TRUE) %>%
+    set_engine(engine = "prophet_xgboost") %>% 
+    fit(value~., data = train_data)
+
+fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar') %>% 
+    fit(value~., data = train_data)
+
+fit_mars <- mars("regression") %>%
+    set_engine("earth") %>%
+    fit(value ~ ., data = train_data)
+
+fit_lm <- linear_reg() %>%
+    set_engine("lm") %>%
+    fit(value ~ ., data = train_data)
+
+```
+
+```{r}
+recursive_ensemble <- modeltime_table(
+    fit_prophet_xgboost, 
+    fit_prophet, 
+    fit_nnetar
+) %>%
+    ensemble_average(type = "mean") %>%
+    recursive(
+        transform  = lag_roll_transformer,
+        train_tail = tail(train_data, 30)
+    )
+
+
+
+
+model_recursive_tbl <- modeltime_table(
+    recursive_ensemble
+)
+
+
+model_recursive_tbl %>%
+    modeltime_forecast(
+        new_data    = future_data,
+        actual_data = sunshine, 
+        keep_data = T
+        )
+
+```
+
+

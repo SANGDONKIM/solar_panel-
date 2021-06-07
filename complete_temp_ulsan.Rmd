@@ -1,0 +1,298 @@
+---
+title: "solar panel data analysis (ulsan)"
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 5
+    fig_height: 4
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+# Preparations (준비작업)
+
+## Libraries
+
+```{r load_lib, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(data.table)
+library(skimr)
+library(tibble)
+library(tibbletime)
+library(timetk)
+library(forecast)
+library(modeltime)
+library(gt)
+library(timetk)
+library(lubridate)
+library(janitor)
+library(tidyquant)
+library(modeltime.resample)
+library(modeltime.ensemble)
+
+# Visualization
+library(ggthemes)
+library(ggsci)
+library(viridis)
+library(ggExtra)
+
+
+theme_set(theme_bw())
+```
+
+## Data load
+
+```{r}
+file_path <- "./data/"
+files <- list.files(file_path)
+files
+```
+
+```{r, message=FALSE}
+rdata2 <- fread(file.path(file_path, "rdata2.csv"))
+rdata1 <- fread(file.path(file_path, "rdata1.csv"))
+```
+
+# 데이터 분석 프로세스
+
+1.  단변량 시계열 모델로 2월 일사량 예측
+
+    -   recursive model 추가
+
+2.  단변량 시계열 모델로 2월 기온 예측
+
+    -   recursive model 추가
+
+3.  예측 변수를 기준으로 다변량 시계열 모형 구축
+
+# 단변량 시계열 모델로 2월 일사량 예측
+
+## Change data type
+
+```{r}
+rdata2 %>%
+    dplyr::select(time, 기온) %>% 
+    mutate(time = ymd_hms(time)) %>% 
+    rename(date = time, value = 기온) %>%  
+    dplyr::filter(between(date, ymd('2015-02-01'), ymd('2021-02-01'))) -> temp
+```
+
+## Generate future frame
+
+```{r}
+future_tbl <- 
+    future_frame(.data = temp,
+                 .date_var = date,
+                 .length_out = '1 month', 
+                 .bind_data  = TRUE) 
+    
+
+
+```
+
+## Standardization
+
+```{r}
+temp %>% 
+    mutate(value = standardize_vec(value)) -> temp
+
+# Standardization Parameters
+# mean: 15.1428800425382
+# standard deviation: 9.41758860904969
+```
+
+## Data split
+
+```{r}
+splits <- time_series_split(temp, assess = "1 month", cumulative = TRUE)
+splits %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, value,
+                           .interact = FALSE, 
+                           .title = "Partition Train / Test")
+```
+
+# Feature engineering
+
+```{r}
+solar_recipe <- 
+    recipe(value~., data = training(splits)) %>% 
+    step_timeseries_signature(date) %>% 
+    step_rm(matches("(iso)|(xts)|(quarter)|(year)|(month)|(qday)|(diff)")) %>% 
+    # step_lag(value, lag = c(24, 168, 720)) %>% 
+    # step_ts_impute(starts_with('lag_'), lambda = 'auto', period = 6) %>% 
+    step_normalize(matches("(index.num)|(yday)")) %>%
+    step_dummy(all_nominal(), one_hot = TRUE) %>%
+    step_interact(~ matches("am.pm") * matches("wday.lbl")) %>%
+    step_fourier(date, period = c(24, 48, 72), K=2)
+    
+solar_recipe %>% prep() %>% juice()
+
+```
+
+# Time series workflow
+
+## Model fitting
+
+```{r}
+model_fit_prophet <- prophet_reg(mode = 'regression',
+                                 seasonality_daily = TRUE, 
+                                 seasonality_yearly = TRUE, 
+                                 growth = 'logistic',
+                                 logistic_floor = min(temp$value),
+                                 logistic_cap = max(temp$value)) %>%
+    set_engine(engine = "prophet") 
+
+wflw_fit_prophet <- workflow() %>% 
+    add_recipe(solar_recipe) %>%
+    add_model(model_fit_prophet) %>%
+    fit(training(splits)) 
+
+
+model_fit_prophet_xgboost <- prophet_boost(mode = 'regression',
+                                           seasonality_daily = TRUE, 
+                                           seasonality_yearly = TRUE, 
+                                           growth = 'logistic',
+                                           logistic_floor = min(temp$value),
+                                           logistic_cap = max(temp$value)
+                                           ) %>%
+    set_engine(engine = "prophet_xgboost")
+
+wflw_fit_prophet_boost <- workflow() %>% 
+    add_recipe(solar_recipe) %>%
+    add_model(model_fit_prophet_xgboost) %>% 
+    fit(training(splits))
+
+
+model_fit_nnetar <- nnetar_reg() %>% 
+    set_engine('nnetar')
+
+wflw_fit_nnetar <- workflow() %>% 
+    add_recipe(solar_recipe) %>% 
+    add_model(model_fit_nnetar) %>% 
+    fit(training(splits))
+
+```
+
+```{r}
+resampling_strategy <- 
+  training(splits) %>%
+  time_series_cv(
+    initial = "1 years",
+    assess = "1 years",
+    skip = "1 years",
+    cumulative = TRUE
+  )
+
+resampling_strategy %>% 
+  plot_time_series_cv_plan(date, value, 
+                           .facet_ncol = 1,
+                           .line_alpha = 0.5,
+                           .interactive = FALSE)
+
+tune_nnetar_model <-
+  nnetar_reg(
+    #non_seasonal_ar = tune(),
+    num_networks = tune(), 
+    #seasonal_ar = tune(), 
+    #hidden_units = tune(),
+    #epochs = tune()
+  ) %>%
+  set_engine("nnetar", scale.inputs = FALSE) %>% #  scale.inputs = FALSE :  @param scale.inputs If TRUE, inputs are scaled by subtracting the column
+  set_mode("regression")
+
+nn_grid <- grid_latin_hypercube(
+  # non_seasonal_ar(range = c(1L, 5L)),
+  # seasonal_ar(range = c(1L, 5L)),
+  # epochs(range = c(50L, 100L)),
+  # num_networks(range = c(30L, 100L)), 
+  #hidden_units(range = c(30L, 100L)),
+    #non_seasonal_ar() %>% range_set(c(1, 5)), 
+    #seasonal_ar() %>% range_set(c(1, 5)), 
+    #epochs() %>% range_set(c(50, 100)), 
+    num_networks() %>% range_set(c(50, 100)),
+    size = 10
+)
+
+resamples_kfold <- training(splits) %>% vfold_cv(v = 5, repeats = 1)
+
+nnetar_workflow <- 
+  workflow() %>% 
+  add_model(tune_nnetar_model) %>% 
+  add_recipe(solar_recipe)
+
+doParallel::registerDoParallel()
+
+tune_results <- nnetar_workflow %>% 
+  tune_grid(
+    resamples = resamples_kfold,
+    param_info = parameters(nnetar_workflow),
+    grid = nn_grid,
+    control = control_grid(verbose = T, allow_par = T, parallel_over = 'everything'))
+
+tuned_best <- tune_results %>%
+    select_best("rmse") # non_seasonal_ar 4
+```
+
+
+
+## Model table
+```{r}
+model_tbl <- modeltime_table(
+  wflw_fit_prophet, 
+  wflw_fit_prophet_boost, 
+  wflw_fit_nnetar
+)
+```
+
+## Calibration
+
+```{r}
+calibration_tbl <- model_tbl %>% 
+  modeltime_calibrate(new_data = testing(splits))
+```
+
+```{r}
+calibration_tbl %>% 
+    modeltime_accuracy(testing(splits)) %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+```
+
+## Refit
+
+```{r}
+refit_tbl <- calibration_tbl %>% 
+    modeltime_refit(data = temp) 
+```
+
+
+## Forecast
+
+```{r}
+refit_tbl %>% 
+    modeltime_forecast(
+        new_data = future_tbl, 
+        actual_data = temp 
+    ) %>% 
+    mutate(across(.value, .fns = ~ standardize_inv_vec(
+        x = .,
+        mean = 15.1428800425382,
+        sd = 9.41758860904969
+    ))) -> result_temp_ulsan_tbl
+
+write.csv(result_temp_ulsan_tbl, 'result_temp_ulsan_tbl.csv')
+
+# Standardization Parameters
+# mean: 15.1428800425382
+# standard deviation: 9.41758860904969
+    
+```
+
+
+
+
